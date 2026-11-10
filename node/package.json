@@ -1,0 +1,30 @@
+{
+  "name": "night-shift-agent-node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Night-Shift Agent - Node.js/TypeScript reference implementation",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "migrate": "tsx src/migrate.ts",
+    "server": "tsx src/server.ts",
+    "worker": "tsx src/worker.ts",
+    "demo:day0": "tsx src/demos/day0.ts",
+    "demo:day2": "tsx src/demos/day2.ts",
+    "demo:day3": "tsx src/demos/day3.ts",
+    "demo:day4": "tsx src/demos/day4.ts",
+    "demo:day5": "tsx src/demos/day5.ts",
+    "test": "tsx --test tests/**/*.test.ts"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
