@@ -5,6 +5,9 @@ from night_shift.worker import worker_loop
 
 
 def main() -> None:
+    import os
+
+    os.environ.setdefault("APPROVAL_TTL_SECONDS", "60")
     print("=== Day 4: approval pause and resume ===\n")
     client = McpHttpClient()
     created = client.triage_tickets(count=40, approvalThreshold=80)

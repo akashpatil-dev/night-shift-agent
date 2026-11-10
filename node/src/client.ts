@@ -1,4 +1,4 @@
-import { HOST, PORT } from "./config.js";
+import { DEFAULT_OWNER, HOST, PORT } from "./config.js";
 
 export type RpcResponse = {
   jsonrpc: string;
@@ -8,17 +8,37 @@ export type RpcResponse = {
 };
 
 export class McpHttpClient {
-  constructor(private baseUrl = `http://${HOST}:${PORT}/mcp`) {}
+  constructor(
+    private baseUrl = `http://${HOST}:${PORT}/mcp`,
+    private owner = DEFAULT_OWNER,
+    private tasksCapable = true,
+  ) {}
 
   async call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    const withMeta =
+      method === "tools/call" && this.tasksCapable
+        ? {
+            ...params,
+            _meta: {
+              "io.modelcontextprotocol/clientCapabilities": {
+                extensions: { "io.modelcontextprotocol/tasks": {} },
+              },
+            },
+          }
+        : params;
+
     const res = await fetch(this.baseUrl, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-owner-id": this.owner,
+        "x-mcp-tasks": this.tasksCapable ? "1" : "0",
+      },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: Date.now(),
         method,
-        params,
+        params: withMeta,
       }),
     });
     const body = (await res.json()) as RpcResponse;
@@ -44,11 +64,7 @@ export class McpHttpClient {
     return this.call("tasks/get", { taskId }) as Promise<Record<string, unknown>>;
   }
 
-  updateTask(
-    taskId: string,
-    requestId: string,
-    decision: "approve" | "deny",
-  ) {
+  updateTask(taskId: string, requestId: string, decision: "approve" | "deny") {
     return this.call("tasks/update", {
       taskId,
       inputResponses: { [requestId]: { decision } },
@@ -57,29 +73,5 @@ export class McpHttpClient {
 
   cancelTask(taskId: string) {
     return this.call("tasks/cancel", { taskId });
-  }
-
-  async waitForStatus(
-    taskId: string,
-    statuses: string[],
-    opts?: { timeoutMs?: number; pollMs?: number },
-  ) {
-    const timeoutMs = opts?.timeoutMs ?? 60_000;
-    const pollMs = opts?.pollMs ?? 100;
-    const start = Date.now();
-    for (;;) {
-      const task = await this.getTask(taskId);
-      const status = String(task.status);
-      const message = String(task.statusMessage ?? "");
-      if (statuses.includes(status) || statuses.includes(message)) {
-        return task;
-      }
-      if (Date.now() - start > timeoutMs) {
-        throw new Error(
-          `Timeout waiting for ${statuses.join("|")} (last=${status}/${message})`,
-        );
-      }
-      await new Promise((r) => setTimeout(r, pollMs));
-    }
   }
 }

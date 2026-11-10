@@ -13,6 +13,11 @@ def to_wire_status(status: str) -> WireStatus:
 
 def to_task_response(task: TaskRow) -> dict[str, Any]:
     status = to_wire_status(task.status)
+    progress = {
+        "processed": task.checkpoint.processed,
+        "total": task.total_tickets,
+        "nextTicket": task.checkpoint.next_ticket,
+    }
     base: dict[str, Any] = {
         "resultType": "complete",
         "taskId": task.id,
@@ -22,14 +27,11 @@ def to_task_response(task: TaskRow) -> dict[str, Any]:
         "lastUpdatedAt": task.updated_at.isoformat(),
         "ttlMs": task.ttl_ms,
         "pollIntervalMs": task.poll_interval_ms,
+        "progress": progress,
     }
     if status == "working":
-        base["progress"] = {
-            "processed": task.checkpoint.processed,
-            "total": task.total_tickets,
-            "nextTicket": task.checkpoint.next_ticket,
-        }
-    elif status == "input_required" and task.approval:
+        return base
+    if status == "input_required" and task.approval:
         base["inputRequests"] = {
             task.approval.requestId: {
                 "type": "approval",
@@ -55,4 +57,12 @@ def create_task_result(task: TaskRow) -> dict[str, Any]:
         "lastUpdatedAt": task.updated_at.isoformat(),
         "ttlMs": task.ttl_ms,
         "pollIntervalMs": task.poll_interval_ms,
+    }
+
+
+def update_ack(task: TaskRow) -> dict[str, Any]:
+    return {
+        "resultType": "complete",
+        "taskId": task.id,
+        "status": to_wire_status(task.status),
     }

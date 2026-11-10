@@ -88,7 +88,12 @@ class TaskRow:
     status: StoreStatus
     checkpoint: Checkpoint
     attempts: int
+    attempt_count: int
+    next_run_at: datetime | None
+    last_error: str | None
     idempotency_key: str | None
+    owner: str
+    trace_id: str | None
     created_at: datetime
     updated_at: datetime
     ttl_ms: int | None

@@ -3,6 +3,7 @@ import { pool } from "../db.js";
 import { workerLoop } from "../worker.js";
 
 async function main() {
+  process.env.APPROVAL_TTL_SECONDS = process.env.APPROVAL_TTL_SECONDS ?? "60";
   console.log("=== Day 4: approval pause and resume ===\n");
   const client = new McpHttpClient();
 

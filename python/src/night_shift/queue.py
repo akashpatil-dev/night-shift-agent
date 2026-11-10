@@ -3,7 +3,7 @@ from __future__ import annotations
 import psycopg
 
 from .config import LEASE_SECONDS
-from .store import _map_row, get_task
+from .store import map_row
 from .types import TaskRow
 
 
@@ -23,6 +23,7 @@ def claim_next_task(
                   status = 'queued'
                   OR (status = 'working' AND (locked_until IS NULL OR locked_until < now()))
                 )
+                AND (next_run_at IS NULL OR next_run_at <= now())
               FOR UPDATE SKIP LOCKED
               LIMIT 1
             )
@@ -49,6 +50,7 @@ def claim_next_task(
                 status = 'queued'
                 OR (status = 'working' AND (locked_until IS NULL OR locked_until < now()))
               )
+              AND (next_run_at IS NULL OR next_run_at <= now())
               ORDER BY created_at
               FOR UPDATE SKIP LOCKED
               LIMIT 1
@@ -67,7 +69,7 @@ def claim_next_task(
             (worker_id, LEASE_SECONDS),
         ).fetchone()
     conn.commit()
-    return _map_row(row) if row else None
+    return map_row(row) if row else None
 
 
 def renew_lease(conn: psycopg.Connection, task_id: str, worker_id: str) -> None:
@@ -81,7 +83,3 @@ def renew_lease(conn: psycopg.Connection, task_id: str, worker_id: str) -> None:
         (LEASE_SECONDS, task_id, worker_id),
     )
     conn.commit()
-
-
-def refresh_task(conn: psycopg.Connection, task_id: str) -> TaskRow | None:
-    return get_task(conn, task_id)

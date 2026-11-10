@@ -32,7 +32,12 @@ export interface TaskRow {
   status: StoreStatus;
   checkpoint: Checkpoint;
   attempts: number;
+  attempt_count: number;
+  next_run_at: Date | null;
+  last_error: string | null;
   idempotency_key: string | null;
+  owner: string;
+  trace_id: string | null;
   created_at: Date;
   updated_at: Date;
   ttl_ms: string | number | null;

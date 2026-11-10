@@ -28,11 +28,8 @@ npm test                # local tests (no CI)
 
 ```bash
 cd python
-# either:
-uv sync --extra dev && uv run night-shift migrate
-# or:
-python -m pip install -e ".[dev]" && night-shift migrate
-
+python -m pip install -e ".[dev]"
+night-shift migrate
 night-shift server          # terminal 1 - http://127.0.0.1:3200/mcp
 night-shift worker          # terminal 2 (optional)
 night-shift demo day0
@@ -40,6 +37,35 @@ pytest                      # local tests (no CI)
 ```
 
 Run Node and Python test suites **one at a time** - they share the same local Postgres and truncate tables between cases.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | `postgres://nightshift:nightshift@127.0.0.1:5432/nightshift` | Postgres |
+| `PORT` | `3100` / `3200` | HTTP port (Node / Python) |
+| `DEFAULT_OWNER` | `demo-user` | Task owner when no `x-owner-id` header |
+| `APPROVER_IDS` | `demo-user,demo-approver` | Identities allowed to approve/deny |
+| `APPROVAL_TTL_SECONDS` | `21600` (6 hours) | Approval window; demos may set `60` |
+| `RETRY_BASE_MS` | `2000` | Exponential backoff base |
+| `RETRY_MAX_ATTEMPTS` | `5` | Then dead-letter; never retry forever |
+| `LEASE_SECONDS` | `30` | Worker lock lease |
+| `LEASE_HEARTBEAT_MS` | `10000` | Renew lease on a timer (not only at checkpoints) |
+| `TTL_RETENTION_MS` | 24h | Delete terminal tasks after retention |
+| `SYNC_MAX_TICKETS` | `20` | Max sync triage when client lacks Tasks capability |
+| `CHECKPOINT_EVERY` | `50` | Checkpoint interval |
+
+Identity: send `x-owner-id` (or `Authorization: Bearer <id>`). Trace: send W3C `traceparent` (or a generated id is stored on the task).
+
+## Behavior highlights
+
+- **Retries + DLQ**: on worker failure, exponential backoff with jitter; after max attempts the job is inserted into `dead_letter` and the task becomes `failed` with `statusMessage: "dead_lettered"`.
+- **Approval**: default **6 hours**; pause happens **before** any `audit_writes` row; deny writes nothing.
+- **Ownership**: `tasks/get|update|cancel` only for the owner; non-owners get `-32602` ("Invalid params"). Approve/deny also requires an approver id.
+- **Idempotency**: `INSERT ... ON CONFLICT DO NOTHING` then `SELECT` for concurrent `idempotency_key` creates.
+- **Capability**: `resultType: "task"` only when the client declares Tasks (`x-mcp-tasks: 1` or `_meta` extensions). Otherwise sync (small cap) or `-32021`.
+- **Metrics**: `GET /metrics` (Prometheus text) - created/completed/failed/dead_lettered/cancelled/retries.
+- **Cancellation**: response includes last `progress` (processed/total).
 
 ## Architecture
 
@@ -51,36 +77,23 @@ flowchart LR
   Worker[Worker_process] --> Queue
   Worker --> Store
   Worker --> Audit[(audit_writes)]
+  Worker --> DLQ[(dead_letter)]
   Worker -->|input_required| Store
   Client -->|tasks_get_or_shim| Server
   Client -->|tasks_update_approve| Server
   Client -->|tasks_cancel| Server
 ```
 
-- **`triage_tickets`** enqueues work and returns a task id immediately.
-- A separate **worker** claims jobs with `FOR UPDATE SKIP LOCKED`, checkpoints every 50 tickets, and resumes after crashes.
-- Side effects go through **`audit_writes`** with idempotency keys in the **same transaction**.
-- High-severity tickets pause in **`input_required`** until approve/deny (with expiry).
-- Cancellation is cooperative; TTL cleanup expires stale tasks.
-
-Internal store status `queued` maps to wire status `working` with `statusMessage: "queued"`.
-
 ## MCP Tasks (SEP-2663) and SDK gaps
 
 | Runtime | Surface |
 |---|---|
-| **Node** | HTTP JSON-RPC at `/mcp` with native-shaped methods `tasks/get`, `tasks/update`, `tasks/cancel`, plus tool `triage_tickets` returning `resultType: "task"`. Tool shims `get_task` / `update_task` / `cancel_task` are also listed for clients that only speak tools. |
-| **Python** | The official `mcp` package does **not** implement SEP-2663 yet. This repo uses a **tool-based shim** (`get_task`, `update_task`, `cancel_task`) returning the same JSON shapes. The HTTP demo server also accepts `tasks/*` method names as a local alias - that is **not** official SDK support. |
-
-When the Python SDK gains Tasks, prefer the native methods and keep the tool names as a compatibility layer.
+| **Node** | HTTP JSON-RPC with native-shaped methods `tasks/get`, `tasks/update`, `tasks/cancel`, plus tool `triage_tickets` returning `resultType: "task"` when the client declares Tasks. |
+| **Python** | The released official `mcp` package still has **no** Tasks server module (verified: no `mcp.server.tasks`). This repo uses a **tool-based shim** (`get_task`, `update_task`, `cancel_task`). HTTP also accepts `tasks/*` aliases for demos - that is not SDK support. |
 
 ## Demos
 
-See [demos/README.md](demos/README.md) for day0 / day2–day5 scripts (fragile vs queued, crash/resume, idempotent retry, approval, cancel).
-
-## Production checklist
-
-See [checklist/NIGHT_SHIFT_CHECKLIST.md](checklist/NIGHT_SHIFT_CHECKLIST.md).
+See [demos/README.md](demos/README.md).
 
 ## Series posts
 
@@ -89,6 +102,10 @@ See [checklist/NIGHT_SHIFT_CHECKLIST.md](checklist/NIGHT_SHIFT_CHECKLIST.md).
 - Day 3 - retry without writing anything twice.
 - Day 4 - pause for human approval.
 - Day 5 - cancel a job.
+
+## Production checklist
+
+See [checklist/NIGHT_SHIFT_CHECKLIST.md](checklist/NIGHT_SHIFT_CHECKLIST.md).
 
 ## License
 

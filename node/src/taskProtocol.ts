@@ -1,6 +1,5 @@
 import type { TaskRow, WireStatus } from "./types.js";
 
-/** Map internal store status to SEP-2663 wire status. */
 export function toWireStatus(status: TaskRow["status"]): WireStatus {
   if (status === "queued") return "working";
   return status;
@@ -11,30 +10,26 @@ export function toTaskResponse(task: TaskRow) {
   const ttlMs =
     task.ttl_ms === null || task.ttl_ms === undefined ? null : Number(task.ttl_ms);
 
+  const progress = {
+    processed: task.checkpoint.processed,
+    total: task.total_tickets,
+    nextTicket: task.checkpoint.next_ticket,
+  };
+
   const base = {
     resultType: "complete" as const,
     taskId: task.id,
     status,
     statusMessage:
-      task.status === "queued"
-        ? "queued"
-        : task.status_message ?? undefined,
+      task.status === "queued" ? "queued" : task.status_message ?? undefined,
     createdAt: task.created_at.toISOString(),
     lastUpdatedAt: task.updated_at.toISOString(),
     ttlMs,
     pollIntervalMs: task.poll_interval_ms,
+    progress,
   };
 
-  if (status === "working") {
-    return {
-      ...base,
-      progress: {
-        processed: task.checkpoint.processed,
-        total: task.total_tickets,
-        nextTicket: task.checkpoint.next_ticket,
-      },
-    };
-  }
+  if (status === "working") return base;
 
   if (status === "input_required" && task.approval) {
     return {
@@ -58,6 +53,7 @@ export function toTaskResponse(task: TaskRow) {
     return { ...base, error: task.error };
   }
 
+  // cancelled includes last progress
   return base;
 }
 
@@ -71,5 +67,13 @@ export function createTaskResult(task: TaskRow) {
     lastUpdatedAt: task.updated_at.toISOString(),
     ttlMs: task.ttl_ms === null || task.ttl_ms === undefined ? null : Number(task.ttl_ms),
     pollIntervalMs: task.poll_interval_ms,
+  };
+}
+
+export function updateAck(task: TaskRow) {
+  return {
+    resultType: "complete" as const,
+    taskId: task.id,
+    status: toWireStatus(task.status),
   };
 }

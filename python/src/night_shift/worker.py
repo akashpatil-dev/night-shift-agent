@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from .config import APPROVAL_TTL_MS, CHECKPOINT_EVERY, TICKET_DELAY_MS
+from .config import APPROVAL_TTL_MS, CHECKPOINT_EVERY, LEASE_HEARTBEAT_MS, TICKET_DELAY_MS
 from .db import connect
 from .logging_util import log
+from .metrics import inc
 from .queue import claim_next_task, renew_lease
 from .store import (
     expire_approvals_and_ttl,
     get_task,
+    schedule_retry_or_dead_letter,
     update_task_fields,
     write_ticket_idempotent,
 )
@@ -21,15 +24,8 @@ from .types import ApprovalState, Checkpoint, TaskRow
 
 def process_ticket(conn, task: TaskRow, ticket_id: int) -> tuple[bool, ApprovalState | None]:
     ticket = make_ticket(ticket_id)
-    with conn.transaction():
-        write_ticket_idempotent(
-            conn,
-            task_id=task.id,
-            ticket_id=ticket_id,
-            payload={"action": "triage", "ticket": ticket},
-            commit=False,
-        )
 
+    # Approval BEFORE any side-effect write
     if needs_approval(ticket["severity"], task.approval_threshold):
         already = (
             task.approval
@@ -57,6 +53,15 @@ def process_ticket(conn, task: TaskRow, ticket_id: int) -> tuple[bool, ApprovalS
                 checkpoint=Checkpoint(processed=ticket_id, next_ticket=ticket_id),
             )
             return True, approval
+
+    with conn.transaction():
+        write_ticket_idempotent(
+            conn,
+            task_id=task.id,
+            ticket_id=ticket_id,
+            payload={"action": "triage", "ticket": ticket},
+            commit=False,
+        )
     return False, None
 
 
@@ -72,90 +77,118 @@ def run_task(
 
     current = task
     ticket_id = current.checkpoint.next_ticket
-    log.info(
-        "task_started",
-        task_id=current.id,
-        attempt=current.attempts,
-        next_ticket=ticket_id,
-    )
+    stop_hb = threading.Event()
 
-    while ticket_id < current.total_tickets:
-        fresh = get_task(conn, current.id)
-        if not fresh:
-            return "cancelled"
-        current = fresh
+    def heartbeat() -> None:
+        while not stop_hb.wait(LEASE_HEARTBEAT_MS / 1000.0):
+            try:
+                renew_lease(conn, current.id, worker_id)
+            except Exception:  # noqa: BLE001
+                pass
 
-        if current.cancel_requested:
-            update_task_fields(
-                conn,
-                current.id,
-                status="cancelled",
-                status_message="cancelled",
-                locked_by=None,
-                locked_until=None,
-                checkpoint=Checkpoint(processed=ticket_id, next_ticket=ticket_id),
-            )
-            log.info("task_cancelled", task_id=current.id, ticket=ticket_id)
-            return "cancelled"
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
 
-        if current.status == "input_required":
-            log.info("task_waiting_approval", task_id=current.id)
-            return "paused"
+    try:
+        log.info(
+            "task_started",
+            task_id=current.id,
+            trace_id=current.trace_id,
+            attempt=current.attempt_count,
+            next_ticket=ticket_id,
+        )
 
-        paused, approval = process_ticket(conn, current, ticket_id)
-        if paused:
-            log.info(
-                "task_input_required",
-                task_id=current.id,
-                ticket=ticket_id,
-                request_id=approval.requestId if approval else None,
-            )
-            return "paused"
+        while ticket_id < current.total_tickets:
+            fresh = get_task(conn, current.id)
+            if not fresh:
+                return "cancelled"
+            current = fresh
 
-        ticket_id += 1
-        checkpoint = Checkpoint(processed=ticket_id, next_ticket=ticket_id)
+            if current.cancel_requested:
+                update_task_fields(
+                    conn,
+                    current.id,
+                    status="cancelled",
+                    status_message="cancelled",
+                    locked_by=None,
+                    locked_until=None,
+                    checkpoint=Checkpoint(processed=ticket_id, next_ticket=ticket_id),
+                )
+                inc("tasks_cancelled")
+                log.info(
+                    "task_cancelled",
+                    task_id=current.id,
+                    trace_id=current.trace_id,
+                    ticket=ticket_id,
+                )
+                return "cancelled"
 
-        if ticket_id % CHECKPOINT_EVERY == 0 or ticket_id >= current.total_tickets:
-            update_task_fields(conn, current.id, checkpoint=checkpoint)
-            renew_lease(conn, current.id, worker_id)
-            log.info(
-                "checkpoint",
-                task_id=current.id,
-                processed=checkpoint.processed,
-                total=current.total_tickets,
-            )
+            if current.status == "input_required":
+                return "paused"
 
-        if crash_after_ticket is not None and ticket_id >= crash_after_ticket:
-            update_task_fields(
-                conn,
-                current.id,
-                checkpoint=checkpoint,
-                locked_until=datetime(1970, 1, 1, tzinfo=timezone.utc),
-                status_message="crashed",
-            )
-            log.warn("simulated_crash", task_id=current.id, ticket=ticket_id)
-            return "crashed"
+            paused, approval = process_ticket(conn, current, ticket_id)
+            if paused:
+                log.info(
+                    "task_input_required",
+                    task_id=current.id,
+                    trace_id=current.trace_id,
+                    ticket=ticket_id,
+                    request_id=approval.requestId if approval else None,
+                )
+                return "paused"
 
-        if TICKET_DELAY_MS > 0:
-            time.sleep(TICKET_DELAY_MS / 1000.0)
+            ticket_id += 1
+            checkpoint = Checkpoint(processed=ticket_id, next_ticket=ticket_id)
 
-    update_task_fields(
-        conn,
-        current.id,
-        status="completed",
-        checkpoint=Checkpoint(
-            processed=current.total_tickets, next_ticket=current.total_tickets
-        ),
-        result={
-            "triaged": current.total_tickets,
-            "message": f"Triaged {current.total_tickets} tickets",
-        },
-        status_message="completed",
-        locked_by=None,
-        locked_until=None,
-    )
-    log.info("task_completed", task_id=current.id)
-    return "completed"
+            if ticket_id % CHECKPOINT_EVERY == 0 or ticket_id >= current.total_tickets:
+                update_task_fields(conn, current.id, checkpoint=checkpoint)
+                log.info(
+                    "checkpoint",
+                    task_id=current.id,
+                    trace_id=current.trace_id,
+                    processed=checkpoint.processed,
+                    total=current.total_tickets,
+                )
+
+            if crash_after_ticket is not None and ticket_id >= crash_after_ticket:
+                update_task_fields(
+                    conn,
+                    current.id,
+                    checkpoint=checkpoint,
+                    locked_until=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                    status_message="crashed",
+                )
+                log.warn(
+                    "simulated_crash",
+                    task_id=current.id,
+                    trace_id=current.trace_id,
+                    ticket=ticket_id,
+                )
+                return "crashed"
+
+            if TICKET_DELAY_MS > 0:
+                time.sleep(TICKET_DELAY_MS / 1000.0)
+
+        update_task_fields(
+            conn,
+            current.id,
+            status="completed",
+            checkpoint=Checkpoint(
+                processed=current.total_tickets, next_ticket=current.total_tickets
+            ),
+            result={
+                "triaged": current.total_tickets,
+                "message": f"Triaged {current.total_tickets} tickets",
+            },
+            status_message="completed",
+            locked_by=None,
+            locked_until=None,
+        )
+        inc("tasks_completed")
+        log.info("task_completed", task_id=current.id, trace_id=current.trace_id)
+        return "completed"
+    finally:
+        stop_hb.set()
 
 
 def worker_loop(
@@ -186,16 +219,13 @@ def worker_loop(
                     crash_after_ticket=crash_after_ticket,
                 )
             except Exception as err:  # noqa: BLE001
-                log.error("task_failed", task_id=task.id, error=str(err))
-                update_task_fields(
-                    conn,
-                    task.id,
-                    status="failed",
-                    error={"code": "worker_error", "message": str(err)},
-                    status_message="failed",
-                    locked_by=None,
-                    locked_until=None,
+                log.error(
+                    "task_failed",
+                    task_id=task.id,
+                    trace_id=task.trace_id,
+                    error=str(err),
                 )
+                schedule_retry_or_dead_letter(conn, task, str(err))
             if once:
                 return
     finally:
@@ -203,4 +233,11 @@ def worker_loop(
 
 
 if __name__ == "__main__":
-    worker_loop()
+    worker_loop(
+        task_id=os.environ.get("TASK_ID") or None,
+        crash_after_ticket=(
+            int(os.environ["CRASH_AFTER_TICKET"])
+            if os.environ.get("CRASH_AFTER_TICKET")
+            else None
+        ),
+    )

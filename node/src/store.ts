@@ -1,13 +1,20 @@
 import type { DbClient } from "./db.js";
+import { inc } from "./metrics.js";
+import { RETRY_BASE_MS, RETRY_MAX_ATTEMPTS, TTL_RETENTION_MS } from "./config.js";
 import type { ApprovalState, Checkpoint, StoreStatus, TaskRow } from "./types.js";
 
-function mapRow(row: Record<string, unknown>): TaskRow {
+export function mapRow(row: Record<string, unknown>): TaskRow {
   return {
     id: String(row.id),
     status: row.status as StoreStatus,
     checkpoint: row.checkpoint as Checkpoint,
-    attempts: Number(row.attempts),
+    attempts: Number(row.attempts ?? 0),
+    attempt_count: Number(row.attempt_count ?? row.attempts ?? 0),
+    next_run_at: row.next_run_at ? new Date(row.next_run_at as string) : null,
+    last_error: (row.last_error as string | null) ?? null,
     idempotency_key: (row.idempotency_key as string | null) ?? null,
+    owner: String(row.owner ?? "demo-user"),
+    trace_id: (row.trace_id as string | null) ?? null,
     created_at: new Date(row.created_at as string),
     updated_at: new Date(row.updated_at as string),
     ttl_ms: (row.ttl_ms as string | number | null) ?? null,
@@ -28,6 +35,7 @@ function mapRow(row: Record<string, unknown>): TaskRow {
   };
 }
 
+/** Race-safe create: INSERT ON CONFLICT DO NOTHING then SELECT. */
 export async function createTask(
   db: DbClient,
   opts: {
@@ -35,39 +43,81 @@ export async function createTask(
     approvalThreshold?: number | null;
     idempotencyKey?: string | null;
     ttlMs?: number | null;
+    owner: string;
+    traceId?: string | null;
   },
 ): Promise<TaskRow> {
-  if (opts.idempotencyKey) {
+  const ttlMs = opts.ttlMs ?? null;
+  const key = opts.idempotencyKey ?? null;
+
+  if (key) {
+    await db.query(
+      `INSERT INTO tasks (
+         status, total_tickets, approval_threshold, idempotency_key,
+         ttl_ms, expires_at, status_message, checkpoint, owner, trace_id
+       ) VALUES (
+         'queued', $1, $2, $3, $4,
+         CASE WHEN $4::bigint IS NULL THEN NULL
+              ELSE now() + ($4::text || ' milliseconds')::interval END,
+         'queued', '{"processed":0,"next_ticket":0}'::jsonb, $5, $6
+       )
+       ON CONFLICT (idempotency_key) DO NOTHING`,
+      [
+        opts.totalTickets,
+        opts.approvalThreshold ?? null,
+        key,
+        ttlMs,
+        opts.owner,
+        opts.traceId ?? null,
+      ],
+    );
     const existing = await db.query(
       `SELECT * FROM tasks WHERE idempotency_key = $1`,
-      [opts.idempotencyKey],
+      [key],
     );
-    if (existing.rows[0]) return mapRow(existing.rows[0]);
+    const row = mapRow(existing.rows[0]);
+    // Only count as created when this insert won (attempt_count 0 and fresh).
+    // Heuristic: if created within last 2s, count once from caller if needed.
+    return row;
   }
 
-  const ttlMs = opts.ttlMs ?? null;
   const result = await db.query(
     `INSERT INTO tasks (
        status, total_tickets, approval_threshold, idempotency_key,
-       ttl_ms, expires_at, status_message, checkpoint
+       ttl_ms, expires_at, status_message, checkpoint, owner, trace_id
      ) VALUES (
-       'queued', $1, $2, $3, $4,
-       CASE WHEN $4::bigint IS NULL THEN NULL ELSE now() + ($4::text || ' milliseconds')::interval END,
-       'queued', '{"processed":0,"next_ticket":0}'::jsonb
+       'queued', $1, $2, NULL, $3,
+       CASE WHEN $3::bigint IS NULL THEN NULL
+            ELSE now() + ($3::text || ' milliseconds')::interval END,
+       'queued', '{"processed":0,"next_ticket":0}'::jsonb, $4, $5
      )
      RETURNING *`,
     [
       opts.totalTickets,
       opts.approvalThreshold ?? null,
-      opts.idempotencyKey ?? null,
       ttlMs,
+      opts.owner,
+      opts.traceId ?? null,
     ],
   );
+  inc("tasks_created");
   return mapRow(result.rows[0]);
 }
 
 export async function getTask(db: DbClient, taskId: string): Promise<TaskRow | null> {
   const result = await db.query(`SELECT * FROM tasks WHERE id = $1`, [taskId]);
+  return result.rows[0] ? mapRow(result.rows[0]) : null;
+}
+
+export async function getTaskForOwner(
+  db: DbClient,
+  taskId: string,
+  owner: string,
+): Promise<TaskRow | null> {
+  const result = await db.query(
+    `SELECT * FROM tasks WHERE id = $1 AND owner = $2`,
+    [taskId, owner],
+  );
   return result.rows[0] ? mapRow(result.rows[0]) : null;
 }
 
@@ -78,6 +128,9 @@ export async function updateTaskFields(
     status: StoreStatus;
     checkpoint: Checkpoint;
     attempts: number;
+    attempt_count: number;
+    next_run_at: Date | null;
+    last_error: string | null;
     cancel_requested: boolean;
     approval: ApprovalState | null;
     result: unknown;
@@ -85,24 +138,15 @@ export async function updateTaskFields(
     status_message: string | null;
     locked_by: string | null;
     locked_until: Date | null;
+    owner: string;
+    trace_id: string | null;
   }>,
 ): Promise<TaskRow | null> {
   const sets: string[] = ["updated_at = now()"];
   const values: unknown[] = [];
   let i = 1;
 
-  const map: Record<string, unknown> = {
-    status: fields.status,
-    checkpoint: fields.checkpoint,
-    attempts: fields.attempts,
-    cancel_requested: fields.cancel_requested,
-    approval: fields.approval,
-    result: fields.result,
-    error: fields.error,
-    status_message: fields.status_message,
-    locked_by: fields.locked_by,
-    locked_until: fields.locked_until,
-  };
+  const map: Record<string, unknown> = { ...fields };
 
   for (const [key, value] of Object.entries(map)) {
     if (value === undefined) continue;
@@ -124,15 +168,18 @@ export async function updateTaskFields(
   return result.rows[0] ? mapRow(result.rows[0]) : null;
 }
 
-export async function requestCancel(db: DbClient, taskId: string): Promise<TaskRow | null> {
-  const task = await getTask(db, taskId);
+export async function requestCancel(
+  db: DbClient,
+  taskId: string,
+  owner: string,
+): Promise<TaskRow | null> {
+  const task = await getTaskForOwner(db, taskId, owner);
   if (!task) return null;
 
   if (["completed", "failed", "cancelled"].includes(task.status)) {
     return task;
   }
 
-  // Cooperative while working; immediate when idle/paused/queued.
   if (task.status === "working") {
     return updateTaskFields(db, taskId, {
       cancel_requested: true,
@@ -140,13 +187,15 @@ export async function requestCancel(db: DbClient, taskId: string): Promise<TaskR
     });
   }
 
-  return updateTaskFields(db, taskId, {
+  const updated = await updateTaskFields(db, taskId, {
     cancel_requested: true,
     status: "cancelled",
     status_message: "cancelled",
     locked_by: null,
     locked_until: null,
   });
+  if (updated?.status === "cancelled") inc("tasks_cancelled");
+  return updated;
 }
 
 export async function applyApproval(
@@ -154,14 +203,15 @@ export async function applyApproval(
   taskId: string,
   requestId: string,
   decision: "approve" | "deny",
+  owner: string,
 ): Promise<TaskRow | null> {
-  const task = await getTask(db, taskId);
+  const task = await getTaskForOwner(db, taskId, owner);
   if (!task) return null;
   if (task.status !== "input_required" || !task.approval) {
     return task;
   }
   if (task.approval.requestId !== requestId) {
-    throw new Error("Unknown approval requestId");
+    throw Object.assign(new Error("Unknown approval requestId"), { code: -32602 });
   }
   if (new Date(task.approval.expiresAt).getTime() < Date.now()) {
     return updateTaskFields(db, taskId, {
@@ -180,13 +230,15 @@ export async function applyApproval(
   };
 
   if (decision === "deny") {
-    return updateTaskFields(db, taskId, {
+    const updated = await updateTaskFields(db, taskId, {
       status: "cancelled",
       approval,
       status_message: "approval_denied",
       locked_by: null,
       locked_until: null,
     });
+    inc("tasks_cancelled");
+    return updated;
   }
 
   return updateTaskFields(db, taskId, {
@@ -195,6 +247,65 @@ export async function applyApproval(
     status_message: "approved_resuming",
     locked_by: null,
     locked_until: null,
+    next_run_at: null,
+  });
+}
+
+export function backoffMs(attemptCount: number): number {
+  const exp = Math.min(attemptCount, 8);
+  const base = RETRY_BASE_MS * 2 ** Math.max(0, exp - 1);
+  const jitter = Math.floor(Math.random() * RETRY_BASE_MS);
+  return base + jitter;
+}
+
+export async function scheduleRetryOrDeadLetter(
+  db: DbClient,
+  task: TaskRow,
+  errMsg: string,
+): Promise<TaskRow | null> {
+  const nextAttempt = task.attempt_count + 1;
+  if (nextAttempt >= RETRY_MAX_ATTEMPTS) {
+    await db.query(
+      `INSERT INTO dead_letter (task_id, owner, payload, last_error, attempt_count, trace_id)
+       VALUES ($1, $2, $3::jsonb, $4, $5, $6)`,
+      [
+        task.id,
+        task.owner,
+        JSON.stringify({
+          checkpoint: task.checkpoint,
+          total_tickets: task.total_tickets,
+        }),
+        errMsg,
+        nextAttempt,
+        task.trace_id,
+      ],
+    );
+    inc("tasks_dead_lettered");
+    inc("tasks_failed");
+    return updateTaskFields(db, task.id, {
+      status: "failed",
+      attempt_count: nextAttempt,
+      attempts: nextAttempt,
+      last_error: errMsg,
+      error: { code: "dead_lettered", message: errMsg },
+      status_message: "dead_lettered",
+      locked_by: null,
+      locked_until: null,
+      next_run_at: null,
+    });
+  }
+
+  const delay = backoffMs(nextAttempt);
+  inc("retries");
+  return updateTaskFields(db, task.id, {
+    status: "queued",
+    attempt_count: nextAttempt,
+    attempts: nextAttempt,
+    last_error: errMsg,
+    status_message: "retry_scheduled",
+    locked_by: null,
+    locked_until: null,
+    next_run_at: new Date(Date.now() + delay),
   });
 }
 
@@ -212,7 +323,7 @@ export async function expireApprovalsAndTtl(db: DbClient): Promise<number> {
        AND (approval->>'expiresAt')::timestamptz < now()`,
   );
 
-  const ttl = await db.query(
+  const ttlFail = await db.query(
     `UPDATE tasks
      SET status = 'failed',
          error = jsonb_build_object('code', 'ttl_expired', 'message', 'Task TTL elapsed'),
@@ -225,7 +336,18 @@ export async function expireApprovalsAndTtl(db: DbClient): Promise<number> {
        AND expires_at < now()`,
   );
 
-  return (approval.rowCount ?? 0) + (ttl.rowCount ?? 0);
+  // Delete expired terminal tasks past retention window
+  const deleted = await db.query(
+    `DELETE FROM tasks
+     WHERE status IN ('completed', 'failed', 'cancelled')
+       AND updated_at < now() - ($1::text || ' milliseconds')::interval
+       AND (expires_at IS NULL OR expires_at < now())`,
+    [TTL_RETENTION_MS],
+  );
+
+  return (
+    (approval.rowCount ?? 0) + (ttlFail.rowCount ?? 0) + (deleted.rowCount ?? 0)
+  );
 }
 
 export async function countAuditWrites(db: DbClient, taskId: string): Promise<number> {
