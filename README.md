@@ -84,11 +84,11 @@ See [checklist/NIGHT_SHIFT_CHECKLIST.md](checklist/NIGHT_SHIFT_CHECKLIST.md).
 
 ## Series posts
 
-- Day 0 - *(placeholder)*
-- Day 2 - *(placeholder)*
-- Day 3 - *(placeholder)*
-- Day 4 - *(placeholder)*
-- Day 5 - *(placeholder)*
+- Day 0 - the fragile version that fails at ticket 1,400, next to the fixed version.
+- Day 2 - kill the worker and watch it resume.
+- Day 3 - retry without writing anything twice.
+- Day 4 - pause for human approval.
+- Day 5 - cancel a job.
 
 ## License
 

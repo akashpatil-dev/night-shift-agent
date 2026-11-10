@@ -39,8 +39,8 @@ uv run night-shift demo day5
 
 | Demo | Shows |
 |---|---|
-| day0 | Fragile blocking crash vs queued immediate handle |
-| day2 | Kill mid-run; resume from checkpoint |
-| day3 | Forced retry; no duplicate audit writes |
-| day4 | Approval pause and resume |
-| day5 | Cancel mid-run; cancel after completion |
+| day0 | The fragile version that fails at ticket 1,400, next to the fixed version |
+| day2 | Kill the worker and watch it resume |
+| day3 | Retry without writing anything twice |
+| day4 | Pause for human approval |
+| day5 | Cancel a job |
