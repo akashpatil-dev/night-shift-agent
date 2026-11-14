@@ -97,11 +97,13 @@ See [demos/README.md](demos/README.md).
 
 ## Series posts
 
-- Day 0 - the fragile version that fails at ticket 1,400, next to the fixed version.
-- Day 2 - kill the worker and watch it resume.
-- Day 3 - retry without writing anything twice.
-- Day 4 - pause for human approval.
-- Day 5 - cancel a job.
+- [Day 0: Your agent needs a job queue](https://patilsperspectives.substack.com/p/day-0-your-agent-needs-a-job-queue)
+- [Day 1: MCP Tasks - return a task handle](https://patilsperspectives.substack.com/p/day-1-mcp-tasks-in-2026-return-a)
+- [Day 2: Kill the worker](https://patilsperspectives.substack.com/p/day-2-kill-the-worker-checkpoints)
+- [Day 3: Retries without duplicates](https://patilsperspectives.substack.com/p/day-3-retries-without-duplicate-side)
+- [Day 4: Human approval](https://patilsperspectives.substack.com/p/day-4-human-approval-without-a-stuck)
+- [Day 5: Cancellation](https://patilsperspectives.substack.com/p/day-5-cancellation-is-not)
+- [Day 6: Production checklist](https://patilsperspectives.substack.com/p/day-6-the-night-shift-production)
 
 ## Production checklist
 
